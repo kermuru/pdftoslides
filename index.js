@@ -3,16 +3,16 @@ const multer = require("multer");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const os = require("node:os");
-const { execFile } = require("node:child_process");
-const { promisify } = require("node:util");
-
-const execFileAsync = promisify(execFile);
+const { createReadStream } = require("node:fs");
+const yauzl = require("yauzl");
+const yazl = require("yazl");
 
 const app = express();
+
 const upload = multer({
   dest: os.tmpdir(),
   limits: {
-    fileSize: 50 * 1024 * 1024,
+    fileSize: 100 * 1024 * 1024,
   },
 });
 
@@ -20,149 +20,202 @@ app.get("/health", (_req, res) => {
   res.status(200).send("ok");
 });
 
-app.post("/render-pdf-to-mp4", upload.single("file"), async (req, res) => {
+app.post("/patch-pptx-transitions", upload.single("file"), async (req, res) => {
   let workdir = null;
 
   try {
-    const slideDuration = Number(req.body.slideDuration ?? 5);
-    const fadeDuration = Number(req.body.fadeDuration ?? 1);
-    const fps = Number(req.body.fps ?? 30);
-    const width = Number(req.body.width ?? 1280);
-    const height = Number(req.body.height ?? 720);
-    const outputName = String(req.body.outputName ?? "slides-video.mp4");
-
     if (!req.file) {
-      return res.status(400).json({ error: "Missing PDF file in field 'file'" });
+      return res.status(400).json({ error: "Missing PPTX file in field 'file'" });
     }
 
-    if (!Number.isFinite(slideDuration) || slideDuration <= 0) {
+    const slideDurationSeconds = Number(req.body.slideDuration ?? 5);
+    const outputName = String(req.body.outputName ?? "patched-slides.pptx");
+
+    if (!Number.isFinite(slideDurationSeconds) || slideDurationSeconds <= 0) {
       return res.status(400).json({ error: "slideDuration must be > 0" });
     }
 
-    if (!Number.isFinite(fadeDuration) || fadeDuration <= 0 || fadeDuration >= slideDuration) {
-      return res.status(400).json({
-        error: "fadeDuration must be > 0 and less than slideDuration",
-      });
-    }
+    const advanceMs = Math.round(slideDurationSeconds * 1000);
 
-    workdir = await fs.mkdtemp(path.join(os.tmpdir(), "render-"));
-
-    const pdfPath = path.join(workdir, "input.pdf");
+    workdir = await fs.mkdtemp(path.join(os.tmpdir(), "pptx-patch-"));
+    const inputPath = path.join(workdir, "input.pptx");
+    const unzipDir = path.join(workdir, "unzipped");
     const outputPath = path.join(workdir, outputName);
-    const framesDir = path.join(workdir, "frames");
 
-    await fs.mkdir(framesDir, { recursive: true });
-    await fs.copyFile(req.file.path, pdfPath);
+    await fs.mkdir(unzipDir, { recursive: true });
+    await fs.copyFile(req.file.path, inputPath);
 
-    await execFileAsync("pdftoppm", [
-      "-png",
-      pdfPath,
-      path.join(framesDir, "slide"),
-    ]);
+    await unzipPptx(inputPath, unzipDir);
+    await patchAllSlides(unzipDir, advanceMs);
+    await zipDirectory(unzipDir, outputPath);
 
-    const files = (await fs.readdir(framesDir))
-      .filter((f) => f.endsWith(".png"))
-      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-
-    if (!files.length) {
-      throw new Error("No PNG frames generated from PDF");
-    }
-
-    const imagePaths = files.map((f) => path.join(framesDir, f));
-    const ffmpegArgs = buildFfmpegArgs({
-      images: imagePaths,
-      outputMp4: outputPath,
-      slideDuration,
-      fadeDuration,
-      fps,
-      width,
-      height,
-    });
-
-    await execFileAsync("ffmpeg", ffmpegArgs, {
-      maxBuffer: 50 * 1024 * 1024,
-    });
-
-    const mp4Buffer = await fs.readFile(outputPath);
-
-    res.setHeader("Content-Type", "video/mp4");
+    const stat = await fs.stat(outputPath);
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    );
     res.setHeader("Content-Disposition", `attachment; filename="${outputName}"`);
-    res.setHeader("Content-Length", String(mp4Buffer.length));
+    res.setHeader("Content-Length", String(stat.size));
 
-    return res.status(200).send(mp4Buffer);
+    const stream = createReadStream(outputPath);
+
+    stream.on("error", (err) => {
+      console.error("Stream error:", err);
+      res.destroy(err);
+    });
+
+    res.on("close", async () => {
+      if (req.file?.path) {
+        await fs.rm(req.file.path, { force: true }).catch(() => {});
+      }
+      if (workdir) {
+        await fs.rm(workdir, { recursive: true, force: true }).catch(() => {});
+      }
+    });
+
+    return stream.pipe(res);
   } catch (err) {
     console.error(err);
-    return res.status(500).json({
-      success: false,
-      error: err?.message || "Rendering failed",
-    });
-  } finally {
     if (req.file?.path) {
       await fs.rm(req.file.path, { force: true }).catch(() => {});
     }
     if (workdir) {
       await fs.rm(workdir, { recursive: true, force: true }).catch(() => {});
     }
+    return res.status(500).json({
+      success: false,
+      error: err?.message || "Failed to patch PPTX",
+    });
   }
 });
 
-function buildFfmpegArgs({
-  images,
-  outputMp4,
-  slideDuration,
-  fadeDuration,
-  fps,
-  width,
-  height,
-}) {
-  const args = ["-y"];
-  const perInputDuration = slideDuration + fadeDuration;
-  const filterParts = [];
+async function patchAllSlides(unzipDir, advanceMs) {
+  const slidesDir = path.join(unzipDir, "ppt", "slides");
 
-  for (const img of images) {
-    args.push("-loop", "1", "-t", String(perInputDuration), "-i", img);
+  let files = await fs.readdir(slidesDir);
+  files = files
+    .filter((name) => /^slide\d+\.xml$/i.test(name))
+    .sort((a, b) => {
+      const na = Number(a.match(/\d+/)?.[0] || 0);
+      const nb = Number(b.match(/\d+/)?.[0] || 0);
+      return na - nb;
+    });
+
+  if (!files.length) {
+    throw new Error("No slide XML files found in PPTX");
   }
 
-  for (let i = 0; i < images.length; i++) {
-    filterParts.push(
-      `[${i}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
-      `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[v${i}]`
+  for (const file of files) {
+    const fullPath = path.join(slidesDir, file);
+    let xml = await fs.readFile(fullPath, "utf8");
+    xml = upsertFadeTransition(xml, advanceMs);
+    await fs.writeFile(fullPath, xml, "utf8");
+  }
+}
+
+function upsertFadeTransition(xml, advanceMs) {
+  const transitionXml = `<p:transition advTm="${advanceMs}"><p:fade/></p:transition>`;
+
+  // Remove existing transition block if present
+  xml = xml.replace(/<p:transition\b[\s\S]*?<\/p:transition>/g, "");
+  xml = xml.replace(/<p:transition\b[^>]*\/>/g, "");
+
+  // Insert transition immediately after <p:cSld ...>...</p:cSld>
+  if (/<p:cSld\b[\s\S]*?<\/p:cSld>/.test(xml)) {
+    return xml.replace(
+      /(<p:cSld\b[\s\S]*?<\/p:cSld>)/,
+      `$1${transitionXml}`
     );
   }
 
-  if (images.length === 1) {
-    filterParts.push(`[v0]copy[outv]`);
-  } else {
-    for (let i = 1; i < images.length; i++) {
-      const left = i === 1 ? `[v0]` : `[x${i - 1}]`;
-      const right = `[v${i}]`;
-      const out = i === images.length - 1 ? `[outv]` : `[x${i}]`;
-      const offset = slideDuration * i;
+  // Fallback: insert before closing </p:sld>
+  if (/<\/p:sld>/.test(xml)) {
+    return xml.replace(/<\/p:sld>/, `${transitionXml}</p:sld>`);
+  }
 
-      filterParts.push(
-        `${left}${right}xfade=transition=fade:duration=${fadeDuration}:offset=${offset}${out}`
-      );
+  throw new Error("Unexpected slide XML structure");
+}
+
+function unzipPptx(zipPath, destDir) {
+  return new Promise((resolve, reject) => {
+    yauzl.open(zipPath, { lazyEntries: true }, (err, zipFile) => {
+      if (err) return reject(err);
+
+      zipFile.readEntry();
+
+      zipFile.on("entry", async (entry) => {
+        try {
+          const outPath = path.join(destDir, entry.fileName);
+
+          if (/\/$/.test(entry.fileName)) {
+            await fs.mkdir(outPath, { recursive: true });
+            zipFile.readEntry();
+            return;
+          }
+
+          await fs.mkdir(path.dirname(outPath), { recursive: true });
+
+          zipFile.openReadStream(entry, (streamErr, readStream) => {
+            if (streamErr) return reject(streamErr);
+
+            const chunks = [];
+            readStream.on("data", (chunk) => chunks.push(chunk));
+            readStream.on("end", async () => {
+              try {
+                await fs.writeFile(outPath, Buffer.concat(chunks));
+                zipFile.readEntry();
+              } catch (writeErr) {
+                reject(writeErr);
+              }
+            });
+            readStream.on("error", reject);
+          });
+        } catch (e) {
+          reject(e);
+        }
+      });
+
+      zipFile.on("end", resolve);
+      zipFile.on("error", reject);
+    });
+  });
+}
+
+async function zipDirectory(sourceDir, outZipPath) {
+  const zipfile = new yazl.ZipFile();
+  const files = await walkFiles(sourceDir);
+
+  for (const file of files) {
+    const relPath = path.relative(sourceDir, file).split(path.sep).join("/");
+    zipfile.addFile(file, relPath);
+  }
+
+  await new Promise((resolve, reject) => {
+    zipfile.outputStream
+      .pipe(require("node:fs").createWriteStream(outZipPath))
+      .on("close", resolve)
+      .on("error", reject);
+    zipfile.end();
+  });
+}
+
+async function walkFiles(dir) {
+  const entries = await fs.readdir(dir, { withFileTypes: true });
+  const files = [];
+
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...(await walkFiles(fullPath)));
+    } else if (entry.isFile()) {
+      files.push(fullPath);
     }
   }
 
-  args.push(
-    "-filter_complex",
-    filterParts.join(";"),
-    "-map",
-    "[outv]",
-    "-r",
-    String(fps),
-    "-c:v",
-    "libx264",
-    "-pix_fmt",
-    "yuv420p",
-    outputMp4
-  );
-
-  return args;
+  return files;
 }
 
 const port = process.env.PORT || 10000;
 app.listen(port, "0.0.0.0", () => {
-  console.log(`Renderer API running on port ${port}`);
+  console.log(`PPTX patcher running on port ${port}`);
 });

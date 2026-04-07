@@ -1,5 +1,5 @@
 {
-  "name": "pdf-to-mp4-renderer",
+  "name": "pptx-transition-patcher",
   "version": "1.0.0",
   "private": true,
   "main": "index.js",
@@ -9,6 +9,8 @@
   },
   "dependencies": {
     "express": "^4.21.2",
-    "multer": "^1.4.5-lts.1"
+    "multer": "^1.4.5-lts.1",
+    "yauzl": "^2.10.0",
+    "yazl": "^2.5.1"
   }
 }
